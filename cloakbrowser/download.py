@@ -31,6 +31,7 @@ from .config import (
     GITHUB_API_URL,
     GITHUB_DOWNLOAD_BASE_URL,
     _version_newer,
+    assert_no_env_overrides,
     check_platform_available,
     get_archive_ext,
     get_archive_name,
@@ -41,7 +42,6 @@ from .config import (
     get_download_url,
     get_effective_version,
     get_fallback_download_url,
-    get_local_binary_override,
     get_platform_tag,
     normalize_release_channel,
     normalize_requested_version,
@@ -202,25 +202,15 @@ def ensure_binary(
 
     Args:
         license_key: Pro license key. Also reads from CLOAKBROWSER_LICENSE_KEY env var.
-        browser_version: Exact Chromium version pin. Also reads from CLOAKBROWSER_VERSION.
+        browser_version: Exact Chromium version pin.
         release_channel: Stable (default) or Preview binary channel.
-
-    Set CLOAKBROWSER_BINARY_PATH to skip download and use a local build.
     """
-    # Check for local override first
-    local_override = get_local_binary_override()
-    if local_override:
-        path = Path(local_override)
-        if not path.exists():
-            raise FileNotFoundError(
-                f"CLOAKBROWSER_BINARY_PATH set to '{local_override}' but file does not exist"
-            )
-        logger.info("Using local binary override: %s", local_override)
-        return str(path)
+    # Every launch path resolves its binary through here, so this is the one
+    # chokepoint where an inherited environment can be refused.
+    assert_no_env_overrides()
 
     requested_version = normalize_requested_version(browser_version)
 
-    # Pro license key check (custom download URL overrides Pro path)
     from .license import (
         CloakBrowserLicenseError,
         resolve_license_key,
@@ -228,8 +218,6 @@ def ensure_binary(
     )
 
     key = resolve_license_key(license_key)
-    if os.environ.get("CLOAKBROWSER_DOWNLOAD_URL"):
-        key = None
 
     if key:
         info = validate_license(key)
@@ -367,22 +355,17 @@ def _download_and_extract(version: str | None = None) -> None:
         tmp_path = Path(tmp.name)
 
     try:
-        # Try primary, fall back to GitHub Releases (skip fallback if custom URL)
+        # Try primary, fall back to GitHub Releases
         try:
             _download_file(primary_url, tmp_path)
         except Exception as primary_err:
-            if os.environ.get("CLOAKBROWSER_DOWNLOAD_URL"):
-                raise
             logger.warning(
                 "Primary download failed (%s), trying GitHub Releases...",
                 primary_err,
             )
             _download_file(fallback_url, tmp_path)
 
-        # Verify the download before extraction. On the official path this is a
-        # mandatory, non-bypassable Ed25519 signature check (see
-        # _verify_download_checksum); the skip flag only applies to custom
-        # self-hosted CLOAKBROWSER_DOWNLOAD_URL setups.
+        # Mandatory, non-bypassable Ed25519 signature check before extraction.
         _verify_download_checksum(tmp_path, version)
 
         _extract_archive(tmp_path, binary_dir, binary_path)
@@ -444,16 +427,6 @@ def _ensure_pro_binary(
 
     # --- Unpinned: track the server's latest selected channel. ---
     effective = get_effective_version(pro=True, release_channel=release_channel)
-
-    # Honor CLOAKBROWSER_AUTO_UPDATE=false the way the free path does: if the user
-    # froze updates AND a Pro build is already cached, keep it and skip the server
-    # check. With no cached build we must still fetch one — a valid Pro license can
-    # never launch the free binary. (The `update` CLI ignores this and always acts.)
-    frozen = os.environ.get("CLOAKBROWSER_AUTO_UPDATE", "").lower() == "false"
-    if frozen and _pro_binary_ready(effective):
-        logger.debug("Pro auto-update disabled; using cached %s", effective)
-        _show_welcome(welcome_tier)
-        return str(get_binary_path(effective, pro=True))
 
     # get_pro_latest_version() is rate-limited to one network call per hour and
     # returns a cached string in between, so this foreground check stays cheap on
@@ -643,43 +616,18 @@ def _verify_pro_download(file_path: Path, version: str) -> None:
 def _verify_download_checksum(file_path: Path, version: str | None = None) -> None:
     """Verify the downloaded archive's integrity and authenticity.
 
-    Official path (cloakbrowser.dev / GitHub Releases): fetch SHA256SUMS plus
-    its detached Ed25519 signature SHA256SUMS.sig, verify the signature against
-    the pinned public keys FIRST, then verify the archive's SHA-256 against the
-    now-authenticated manifest. Mandatory and non-bypassable — a same-origin
-    manifest can no longer certify a tampered binary (#308).
+    Fetch SHA256SUMS plus its detached Ed25519 signature SHA256SUMS.sig, verify
+    the signature against the pinned public keys FIRST, then verify the archive's
+    SHA-256 against the now-authenticated manifest. Mandatory and non-bypassable
+    — a same-origin manifest cannot certify a tampered binary (#308).
 
-    Custom self-hosted path (CLOAKBROWSER_DOWNLOAD_URL set): the pinned keys do
-    not apply to a third-party server, so fall back to the plain same-origin
-    SHA256SUMS check, which CLOAKBROWSER_SKIP_CHECKSUM may bypass.
+    Upstream exempts self-hosted mirrors from the signature check and lets
+    CLOAKBROWSER_SKIP_CHECKSUM bypass it. This fork has no mirror path, so there
+    is no unsigned branch to fall into.
     """
     tarball_name = get_archive_name()
 
-    if os.environ.get("CLOAKBROWSER_DOWNLOAD_URL"):
-        # Self-hosted mirror: signature scheme does not apply. Preserve the
-        # legacy same-origin checksum behavior, skippable as before.
-        if os.environ.get("CLOAKBROWSER_SKIP_CHECKSUM", "").lower() == "true":
-            logger.warning(
-                "CLOAKBROWSER_SKIP_CHECKSUM set — skipping verification for custom download URL"
-            )
-            return
-        checksums = _fetch_checksums(version)
-        if checksums is None:
-            logger.warning(
-                "SHA256SUMS not available from custom URL — skipping checksum verification"
-            )
-            return
-        expected = checksums.get(tarball_name)
-        if expected is None:
-            logger.warning(
-                "SHA256SUMS found but no entry for %s — skipping verification",
-                tarball_name,
-            )
-            return
-        _verify_checksum(file_path, expected)
-        return
-
-    # Official path: signature is the trust root and is non-bypassable.
+    # Signature is the trust root and is non-bypassable.
     manifest = _fetch_signed_manifest(version)
     if manifest is None:
         raise RuntimeError(
@@ -795,26 +743,6 @@ def _verify_signature(manifest_bytes: bytes, sig_b64: bytes) -> None:
         "manifest. The binary's authenticity could not be confirmed. "
         "Report at https://github.com/CloakHQ/cloakbrowser/issues"
     )
-
-
-def _fetch_checksums(version: str | None = None) -> dict[str, str] | None:
-    """Fetch SHA256SUMS file for a version. Returns {filename: hash} or None."""
-    v = version or get_chromium_version()
-    has_custom_url = os.environ.get("CLOAKBROWSER_DOWNLOAD_URL")
-
-    # Build URL list — respect custom URL contract (no GitHub fallback)
-    urls = [f"{DOWNLOAD_BASE_URL}/chromium-v{v}/SHA256SUMS"]
-    if not has_custom_url:
-        urls.append(f"{GITHUB_DOWNLOAD_BASE_URL}/chromium-v{v}/SHA256SUMS")
-
-    for url in urls:
-        try:
-            resp = httpx.get(url, follow_redirects=True, timeout=10.0)
-            resp.raise_for_status()
-            return _parse_checksums(resp.text)
-        except Exception:
-            continue
-    return None
 
 
 def _parse_checksums(text: str) -> dict[str, str]:
@@ -1180,14 +1108,11 @@ def check_for_pro_update(
 
 
 def _should_check_for_update() -> bool:
-    """Check if auto-update is enabled and rate limit hasn't been hit."""
-    if os.environ.get("CLOAKBROWSER_AUTO_UPDATE", "").lower() == "false":
-        return False
-    if get_local_binary_override():
-        return False
-    if os.environ.get("CLOAKBROWSER_DOWNLOAD_URL"):
-        return False
+    """Check whether the update-check rate limit has elapsed.
 
+    Upstream lets CLOAKBROWSER_AUTO_UPDATE=false freeze the engine. Staying
+    current is the point of this fork, so there is no off switch.
+    """
     check_file = get_cache_dir() / ".last_update_check"
     if check_file.exists():
         try:
@@ -1259,10 +1184,6 @@ def _check_wrapper_update() -> None:
     if _wrapper_update_checked:
         return
     _wrapper_update_checked = True
-    if os.environ.get("CLOAKBROWSER_AUTO_UPDATE", "").lower() == "false":
-        return
-    if os.environ.get("CLOAKBROWSER_DOWNLOAD_URL"):
-        return
     try:
         resp = httpx.get(
             "https://pypi.org/pypi/cloakbrowser/json",

@@ -14,6 +14,52 @@ from pathlib import Path
 logger = logging.getLogger("cloakbrowser")
 
 
+class EngineIntegrityError(RuntimeError):
+    """Raised when the environment tries to redirect which engine gets launched."""
+
+
+class FingerprintSeedError(RuntimeError):
+    """Raised when a profile's pinned fingerprint seed is missing or corrupt."""
+
+
+# ---------------------------------------------------------------------------
+# Engine identity is decided by this fork's pin, never by the environment.
+#
+# Fleet agents inherit the launcher's environment, so upstream's override vars
+# are a privilege-escalation path: any of them lets an agent point the wrapper
+# at a different binary, a different origin, or skip verification entirely,
+# without touching reviewed code. This is an allowlist by omission — the vars
+# below are refused outright rather than ignored, so an attempt is loud instead
+# of silently downgrading to upstream defaults.
+#
+# Deliberately NOT a prefix sweep of CLOAKBROWSER_*: the license vars are
+# consumed by the Pro binary itself and the fork's own launcher sets them.
+# ---------------------------------------------------------------------------
+REFUSED_ENV_VARS = (
+    "CLOAKBROWSER_BINARY_PATH",
+    "CLOAKBROWSER_CACHE_DIR",
+    "CLOAKBROWSER_VERSION",
+    "CLOAKBROWSER_RELEASE_CHANNEL",
+    "CLOAKBROWSER_DOWNLOAD_URL",
+    "CLOAKBROWSER_SKIP_CHECKSUM",
+    "CLOAKBROWSER_AUTO_UPDATE",
+    "CLOAKBROWSER_WIDEVINE_CDM",
+    "CLOAKBROWSER_FETCH_WIDEVINE",
+)
+
+
+def assert_no_env_overrides() -> None:
+    """Refuse to launch if the environment carries an engine-redirecting var."""
+    present = sorted(v for v in REFUSED_ENV_VARS if os.environ.get(v))
+    if present:
+        raise EngineIntegrityError(
+            "Refusing to launch: this fork pins the browser engine in code, but "
+            f"the environment sets {', '.join(present)}. Unset them. If you need a "
+            "different engine, change the pin in cloakbrowser/config.py and have "
+            "it reviewed."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Chromium version shipped with this release.
 # Different platforms may ship different versions during transition periods.
@@ -68,7 +114,7 @@ def _random_seed() -> int:
 
 
 def _read_profile_seed(path: Path) -> int | None:
-    """Stored seed, or None if the file is missing or corrupt (corrupt is removed)."""
+    """Stored seed, or None if the file is missing. Corrupt raises."""
     try:
         data = path.read_bytes()
         # Empty = a concurrent launch's exclusive create (no-hard-link fallback)
@@ -83,13 +129,19 @@ def _read_profile_seed(path: Path) -> int | None:
     text = data.strip()
     if text.isdigit() and text.isascii() and SEED_MIN <= int(text) <= SEED_MAX:
         return int(text)
-    # A corrupt file gets a fresh seed (= new identity), so say so loudly.
-    logger.warning("Corrupt fingerprint seed file %s (%r); generating a new seed", path, data[:32])
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass  # a concurrent launch already removed it
-    return None
+    # Upstream unlinks the file and mints a fresh seed, which silently presents
+    # the account a brand-new device. Refuse instead: a corrupt seed is either
+    # disk damage or tampering, and both need a human.
+    raise FingerprintSeedError(
+        f"Fingerprint seed file {path} is corrupt ({data[:32]!r}). Refusing to "
+        "launch with a new identity. Restore the profile's seed from backup, or "
+        "delete the profile if a new identity is genuinely intended."
+    )
+
+
+def _profile_is_initialized(profile: Path) -> bool:
+    """True if Chromium has already written this profile (so it has an identity)."""
+    return any((profile / marker).exists() for marker in ("Local State", "Default"))
 
 
 def _write_synced(path: Path, mode: str, content: str) -> None:
@@ -109,6 +161,10 @@ def persistent_seed_args(
     user arg, so it overrides the random stealth default via build_args dedup.
     An explicit ``--fingerprint`` in ``args`` (including ``=off``) or
     ``stealth_args=False`` leaves the file alone.
+
+    A seed missing from an *already-initialized* profile is treated as tampering
+    and refused, not silently re-minted — otherwise anyone who can unlink the
+    file can hand the account a new device on the next launch.
     """
     if not stealth_args or not user_data_dir:
         return args
@@ -119,6 +175,12 @@ def persistent_seed_args(
     path = profile / PROFILE_SEED_FILE
     seed = _read_profile_seed(path)
     if seed is None:
+        if _profile_is_initialized(profile):
+            raise FingerprintSeedError(
+                f"Profile {profile} has Chromium data but no {PROFILE_SEED_FILE}. "
+                "Refusing to launch with a new identity. Restore the seed file, or "
+                "delete the profile if a new identity is genuinely intended."
+            )
         profile.mkdir(parents=True, exist_ok=True)
         tmp = profile / f"{PROFILE_SEED_FILE}.{uuid.uuid4().hex}.tmp"
         content = f"{_random_seed()}\n"
@@ -148,33 +210,25 @@ def persistent_seed_args(
         # corrupt-file race), fail loudly rather than loop.
         seed = _read_profile_seed(path)
         if seed is None:
-            raise RuntimeError(f"Could not create fingerprint seed file {path}")
+            raise FingerprintSeedError(f"Could not create fingerprint seed file {path}")
     return [f"--fingerprint={seed}", *(args or [])]
 
 
 def get_default_stealth_args() -> list[str]:
-    """Build stealth args with a random fingerprint seed per launch.
+    """Build fingerprint args with a random seed per launch.
 
-    On macOS, skips platform/GPU spoofing — runs as a native Mac browser.
-    Spoofing Windows on Mac creates detectable mismatches (fonts, GPU, etc.).
+    The persona always matches the real host: the binary already detects its own
+    platform at compile time, so no ``--fingerprint-platform`` override is needed
+    or wanted. Upstream spoofs Windows on Linux, which contradicts the real
+    display, GPU and font set — the opposite of a consistent identity.
+
+    The Chromium sandbox is left ON. Run the browser as an unprivileged user; it
+    refuses to start as uid 0 without ``--no-sandbox``, and that refusal is the
+    control working, not a bug to flag away.
     """
     seed = _random_seed()
-    system = platform.system()
 
-    base = [
-        "--no-sandbox",
-        f"--fingerprint={seed}",
-    ]
-
-    if system == "Darwin":
-        # Tell the fingerprint patches we're on macOS so GPU/UA match natively
-        return base + ["--fingerprint-platform=macos"]
-
-    # Linux/Windows: Windows fingerprint profile.
-    # Screen and window size come from the real display, not this flag (verified:
-    # identical across seeds), so the wrapper must not emulate a viewport on top in
-    # headed mode — that would break outerWidth >= innerWidth coherence.
-    return base + ["--fingerprint-platform=windows"]
+    return [f"--fingerprint={seed}"]
 
 
 # ---------------------------------------------------------------------------
@@ -207,22 +261,17 @@ _VERSION_PIN_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){3,4}$")
 
 def normalize_release_channel(release_channel: str | None = None) -> str:
     """Return the requested release channel, defaulting to Stable."""
-    raw = (
-        release_channel
-        if release_channel is not None
-        else os.environ.get("CLOAKBROWSER_RELEASE_CHANNEL", "stable")
-    )
+    raw = release_channel if release_channel is not None else "stable"
     return "preview" if raw.strip().lower() == "preview" else "stable"
 
 
 def normalize_requested_version(version: str | None = None) -> str | None:
-    """Return an explicit Chromium version pin from arg/env, or None.
+    """Return an explicit Chromium version pin, or None.
 
-    The explicit argument wins over CLOAKBROWSER_VERSION. Only numeric dotted
-    versions are accepted because the value is interpolated into cache paths and
-    download URLs.
+    Only numeric dotted versions are accepted because the value is interpolated
+    into cache paths and download URLs.
     """
-    raw = version if version is not None else os.environ.get("CLOAKBROWSER_VERSION")
+    raw = version
     if raw is None:
         return None
     normalized = raw.strip()
@@ -259,14 +308,7 @@ def get_platform_tag() -> str:
 # Binary cache paths
 # ---------------------------------------------------------------------------
 def get_cache_dir() -> Path:
-    """Return the cache directory for downloaded binaries.
-
-    Override with CLOAKBROWSER_CACHE_DIR env var.
-    Default: ~/.cloakbrowser/
-    """
-    custom = os.environ.get("CLOAKBROWSER_CACHE_DIR")
-    if custom:
-        return Path(custom)
+    """Return the cache directory for downloaded binaries (``~/.cloakbrowser``)."""
     return Path.home() / ".cloakbrowser"
 
 
@@ -292,21 +334,15 @@ def get_binary_path(version: str | None = None, pro: bool = False) -> Path:
 
 
 def check_platform_available() -> None:
-    """Raise a clear error if no pre-built binary exists for this platform.
-
-    Skipped when CLOAKBROWSER_BINARY_PATH is set (user has their own build).
-    """
-    if get_local_binary_override():
-        return
-
+    """Raise a clear error if no pre-built binary exists for this platform."""
     tag = get_platform_tag()  # raises if platform unsupported entirely
     if tag not in AVAILABLE_PLATFORMS:
         available = ", ".join(sorted(AVAILABLE_PLATFORMS))
         import sys
 
         sys.exit(
-            f"\n\033[1mCloakBrowser\033[0m — Pre-built binaries are currently only available for: {available}.\n\n"
-            f"To use CloakBrowser now, set CLOAKBROWSER_BINARY_PATH to a local Chromium binary."
+            f"\n\033[1mCloakBrowser\033[0m — Pre-built binaries are currently only "
+            f"available for: {available}.\n"
         )
 
 
@@ -375,10 +411,7 @@ def _version_newer(a: str, b: str) -> bool:
 # ---------------------------------------------------------------------------
 # Download URL
 # ---------------------------------------------------------------------------
-DOWNLOAD_BASE_URL = os.environ.get(
-    "CLOAKBROWSER_DOWNLOAD_URL",
-    "https://cloakbrowser.dev",
-)
+DOWNLOAD_BASE_URL = "https://cloakbrowser.dev"
 
 GITHUB_API_URL = "https://api.github.com/repos/CloakHQ/cloakbrowser/releases"
 
@@ -409,17 +442,6 @@ def get_fallback_download_url(version: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Local binary override (skip download, use your own build)
-# ---------------------------------------------------------------------------
-def get_local_binary_override() -> str | None:
-    """Check if user has set a local binary path via env var.
-
-    Set CLOAKBROWSER_BINARY_PATH to use a locally built Chromium instead of downloading.
-    """
-    return os.environ.get("CLOAKBROWSER_BINARY_PATH")
-
-
-# ---------------------------------------------------------------------------
 # Headless viewport handling by binary version
 # ---------------------------------------------------------------------------
 # First Chromium build that reports coherent headless dimensions without an
@@ -438,22 +460,16 @@ def binary_supports_headless_no_viewport(
     """Whether headless can launch with ``no_viewport`` on the resolved binary.
 
     Only binaries at or above ``HEADLESS_NO_VIEWPORT_MIN_VERSION`` qualify; older
-    ones keep ``DEFAULT_VIEWPORT``. A local override binary
-    (``CLOAKBROWSER_BINARY_PATH``) is unknown-version, so stay on the safe path.
+    ones keep ``DEFAULT_VIEWPORT``.
     """
     if HEADLESS_NO_VIEWPORT_MIN_VERSION is None:
         return False
-    # A declared version (browser_version arg OR CLOAKBROWSER_VERSION env) wins even
-    # under a local override — the caller is asserting the version (also how internal
-    # builds opt in). Only an override with no declared version stays on the safe path.
     try:
         declared = normalize_requested_version(browser_version)
     except ValueError:
         declared = None
     if declared:
         version = declared
-    elif get_local_binary_override():
-        return False
     else:
         from .license import resolve_license_key
 
@@ -503,9 +519,7 @@ def binary_supports_http_proxy_inline_auth(
     ``binary_supports_headless_no_viewport``. A declared pin wins, else a valid
     Pro license resolves to the Pro build (which ships the patch), else the free
     per-platform default — then it compares to this platform's floor. Below the
-    floor, credentialed HTTP proxies fall back to Playwright's proxy dict. A
-    local override with no declared version is unknown-version, so stay on the
-    safe fallback. Python, JS and .NET mirror this gate.
+    floor, credentialed HTTP proxies fall back to Playwright's proxy dict.
     """
     floor = HTTP_PROXY_INLINE_AUTH_MIN_VERSION.get(get_platform_tag())
     if floor is None:
@@ -516,8 +530,6 @@ def binary_supports_http_proxy_inline_auth(
         declared = None
     if declared:
         version = declared
-    elif get_local_binary_override():
-        return False
     else:
         from .license import resolve_license_key
 

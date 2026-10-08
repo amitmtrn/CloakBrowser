@@ -1,12 +1,16 @@
 """Fingerprint seed persistence for persistent profiles (.cloakbrowser-seed)."""
 
-import logging
+import re
 import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cloakbrowser.config import PROFILE_SEED_FILE, persistent_seed_args
+from cloakbrowser.config import (
+    PROFILE_SEED_FILE,
+    FingerprintSeedError,
+    persistent_seed_args,
+)
 
 
 def _listing(d):
@@ -92,16 +96,72 @@ def test_non_persistent_launch_stays_random(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
-@pytest.mark.parametrize("content", [b"", b"abc\n", b"5\n", b"123456\n", b"-12345\n", b"\xff\xfe"])
-def test_corrupt_file_logs_and_regenerates(tmp_path, caplog, content):
+@pytest.mark.parametrize("content", [b"abc\n", b"5\n", b"123456\n", b"-12345\n", b"\xff\xfe", b""])
+def test_corrupt_file_refuses_to_launch(tmp_path, content):
+    """A corrupt seed raises and the file is left on disk for recovery.
+
+    Inverted from the upstream ``test_corrupt_file_logs_and_regenerates``:
+    unlinking and re-minting silently hands the logged-in account a brand-new
+    device. Disk damage and tampering both need a human, so refuse and preserve
+    the evidence. (``b""`` is last: the reader waits ~1s for a concurrent
+    exclusive-create to land before calling an empty file corrupt.)
+    """
     path = tmp_path / PROFILE_SEED_FILE
     path.write_bytes(content)
-    with caplog.at_level(logging.WARNING, logger="cloakbrowser"):
-        args = persistent_seed_args(tmp_path, True, None)
-    assert str(path) in caplog.text
-    stored = path.read_text()
+    with pytest.raises(FingerprintSeedError, match="corrupt"):
+        persistent_seed_args(tmp_path, True, None)
+    assert path.read_bytes() == content, "corrupt seed must not be deleted"
+    assert _listing(tmp_path) == [PROFILE_SEED_FILE], "no replacement seed minted"
+
+
+def test_corrupt_file_error_names_the_path(tmp_path):
+    path = tmp_path / PROFILE_SEED_FILE
+    path.write_bytes(b"abc\n")
+    with pytest.raises(FingerprintSeedError, match=re.escape(str(path))):
+        persistent_seed_args(tmp_path, True, None)
+
+
+@pytest.mark.parametrize("marker", ["Local State", "Default"])
+def test_initialized_profile_missing_seed_refuses(tmp_path, marker):
+    """A profile Chromium has already written must not get a fresh identity.
+
+    Anyone who can unlink ``.cloakbrowser-seed`` could otherwise hand the account
+    a new device on the next launch, so a missing seed beside real profile data is
+    treated as tampering.
+    """
+    if marker == "Default":
+        (tmp_path / marker).mkdir()
+    else:
+        (tmp_path / marker).write_text("{}")
+    with pytest.raises(FingerprintSeedError, match=re.escape(PROFILE_SEED_FILE)):
+        persistent_seed_args(tmp_path, True, None)
+    assert not (tmp_path / PROFILE_SEED_FILE).exists()
+
+
+def test_fresh_profile_dir_still_mints_a_seed(tmp_path):
+    """The refusal is scoped to initialized profiles — a first launch still works."""
+    profile = tmp_path / "new-profile"
+    args = persistent_seed_args(profile, True, None)
+    stored = (profile / PROFILE_SEED_FILE).read_text()
     assert args == [f"--fingerprint={stored.strip()}"]
-    assert 10000 <= int(stored) <= 99999
+
+
+def test_initialized_profile_with_seed_is_fine(tmp_path):
+    """Sanity: the marker files alone don't block a profile that kept its seed."""
+    (tmp_path / "Local State").write_text("{}")
+    (tmp_path / PROFILE_SEED_FILE).write_text("12345\n")
+    assert persistent_seed_args(tmp_path, True, None) == ["--fingerprint=12345"]
+
+
+def test_initialized_profile_missing_seed_honors_explicit_fingerprint(tmp_path):
+    """An explicit --fingerprint opts out of seed management entirely, as before."""
+    (tmp_path / "Local State").write_text("{}")
+    assert persistent_seed_args(tmp_path, True, ["--fingerprint=off"]) == ["--fingerprint=off"]
+
+
+def test_initialized_profile_missing_seed_ignored_without_stealth_args(tmp_path):
+    (tmp_path / "Local State").write_text("{}")
+    assert persistent_seed_args(tmp_path, False, ["--x"]) == ["--x"]
 
 
 def test_python_file_format_is_cross_wrapper(tmp_path):

@@ -13,7 +13,8 @@ import zipfile
 import pytest
 
 import cloakbrowser.download as download
-from cloakbrowser.config import get_binary_dir, get_binary_path
+from cloakbrowser import config
+from cloakbrowser.config import get_binary_dir, get_binary_path, get_cache_dir
 from cloakbrowser.download import (
     _extract_tar,
     _extract_zip,
@@ -215,18 +216,25 @@ class TestConcurrentFirstRun:
         except OSError as err:
             return type(err).__name__
 
-    def _use_local_mirror(self, cache_dir, monkeypatch):
-        monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(cache_dir))
-        monkeypatch.setenv("CLOAKBROWSER_DOWNLOAD_URL", "https://mirror.invalid")
-        monkeypatch.setenv("CLOAKBROWSER_SKIP_CHECKSUM", "true")
-        for name in ("CLOAKBROWSER_LICENSE_KEY", "CLOAKBROWSER_BINARY_PATH", "CLOAKBROWSER_VERSION"):
+    def _isolate_download(self, monkeypatch):
+        """Keep ensure_binary off the network and off the Pro path, and return the
+        cache root it will populate.
+
+        Upstream pointed the download at a fake mirror via
+        CLOAKBROWSER_DOWNLOAD_URL/CLOAKBROWSER_SKIP_CHECKSUM/CLOAKBROWSER_CACHE_DIR.
+        Those are refused env vars here (setting any of them makes ensure_binary
+        raise), so the archive is injected by patching ``_download_file`` and the
+        now-mandatory signature check is stubbed at the function boundary instead.
+        """
+        for name in config.REFUSED_ENV_VARS + ("CLOAKBROWSER_LICENSE_KEY",):
             monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(download, "_verify_download_checksum", lambda path, version=None: None)
+        return get_cache_dir()
 
     @pytest.mark.skipif(platform.system() == "Windows", reason="POSIX exec semantics")
     def test_install_stays_complete_while_other_callers_finish(self, tmp_path, monkeypatch):
         archive = self._create_platform_archive(tmp_path)
-        cache_dir = tmp_path / "cache"
-        self._use_local_mirror(cache_dir, monkeypatch)
+        cache_dir = self._isolate_download(monkeypatch)
 
         # One caller downloads at once. The others have already seen an empty
         # cache but their downloads are held until the first has returned,
@@ -275,7 +283,7 @@ class TestConcurrentFirstRun:
     @pytest.mark.skipif(platform.system() == "Windows", reason="POSIX exec semantics")
     def test_replaces_partial_install_left_by_interrupted_extraction(self, tmp_path, monkeypatch):
         archive = self._create_platform_archive(tmp_path)
-        self._use_local_mirror(tmp_path / "cache", monkeypatch)
+        self._isolate_download(monkeypatch)
         monkeypatch.setattr(
             download, "_download_file", lambda url, dest, headers=None: shutil.copyfile(archive, dest)
         )
@@ -288,8 +296,7 @@ class TestConcurrentFirstRun:
     @pytest.mark.skipif(platform.system() == "Windows", reason="POSIX exec semantics")
     def test_concurrent_callers_replace_partial_install(self, tmp_path, monkeypatch):
         archive = self._create_platform_archive(tmp_path)
-        cache_dir = tmp_path / "cache"
-        self._use_local_mirror(cache_dir, monkeypatch)
+        cache_dir = self._isolate_download(monkeypatch)
 
         # Every caller downloads at the same moment, so all of them find the
         # partial install in the way when they move their extraction into place.

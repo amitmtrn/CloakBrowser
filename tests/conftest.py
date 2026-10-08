@@ -17,10 +17,14 @@ def isolated_cache_dir(request, tmp_path_factory, monkeypatch):
     machine: the developer's key and latest binary, at a stable path. A fresh
     temp cache per test re-downloads the keyless binary every test, and its new
     path re-prompts path-keyed firewalls (LuLu) since the binary is ad-hoc signed.
+
+    Redirects ``$HOME`` rather than setting ``CLOAKBROWSER_CACHE_DIR``: this fork
+    refuses that variable at launch (config.REFUSED_ENV_VARS), so the cache root
+    is ``Path.home() / ".cloakbrowser"`` with no override hook. Moving HOME keeps
+    the isolation without putting a test-only seam in production code.
     """
     if request.node.get_closest_marker("slow") or request.node.get_closest_marker("real_browser"):
         return
-    monkeypatch.setenv(
-        "CLOAKBROWSER_CACHE_DIR",
-        str(tmp_path_factory.mktemp("cloakbrowser-cache")),
-    )
+    home = tmp_path_factory.mktemp("cloakbrowser-home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))

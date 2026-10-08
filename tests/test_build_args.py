@@ -144,11 +144,17 @@ def test_no_duplicate_flags():
 
 
 def test_non_value_flags_preserved():
-    """Flags without = should be preserved without dedup issues."""
+    """Flags without = should be preserved without dedup issues.
+
+    Upstream also asserted the default ``--no-sandbox`` survived here; this fork
+    never adds it (the Chromium sandbox stays on), so the stealth default that
+    must survive dedup is the fingerprint seed.
+    """
     args = build_args(stealth_args=True, extra_args=["--disable-gpu", "--no-zygote"])
     assert "--disable-gpu" in args
     assert "--no-zygote" in args
-    assert "--no-sandbox" in args
+    assert any(a.startswith("--fingerprint=") for a in args)
+    assert "--no-sandbox" not in args
 
 
 def test_override_logs_debug(caplog):

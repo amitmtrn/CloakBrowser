@@ -7,12 +7,15 @@ from pathlib import Path
 import pytest
 
 from cloakbrowser import download
+from cloakbrowser.config import get_cache_dir
 
 
 @pytest.fixture
-def cache(tmp_path, monkeypatch):
-    monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(tmp_path))
-    return tmp_path
+def cache():
+    """The cache root the banner stamps live in (isolated by conftest's HOME redirect)."""
+    cache_dir = get_cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
 
 
 def _banner(capsys, tier):

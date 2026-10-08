@@ -36,7 +36,7 @@ class TestResolveLicenseKey:
             assert resolve_license_key() == "env-key"
 
     def test_returns_none_when_absent(self, tmp_path):
-        # Clearing the env drops CLOAKBROWSER_CACHE_DIR too, so the lookup would
+        # Clearing the env drops conftest's HOME redirect too, so the lookup would
         # fall back to the real ~/.cloakbrowser — patch the dir it reads.
         with patch.dict(os.environ, {}, clear=True):
             os.environ.pop("CLOAKBROWSER_LICENSE_KEY", None)
@@ -377,7 +377,13 @@ class TestGetProLatestVersion:
         assert release.resolved_channel == "preview"
         assert release.fallback is False
 
-    def test_environment_selects_preview(self, tmp_path):
+    def test_environment_cannot_select_preview(self, tmp_path):
+        """CLOAKBROWSER_RELEASE_CHANNEL cannot flip the channel to preview.
+
+        Inverted from the upstream ``test_environment_selects_preview``: the var is
+        refused at launch, so an inherited environment can no longer swap a fleet
+        agent onto preview builds. Only the explicit argument chooses a channel.
+        """
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"version": "151.0.1234.5"}
         mock_resp.raise_for_status = MagicMock()
@@ -391,15 +397,30 @@ class TestGetProLatestVersion:
         ):
             get_pro_latest_version()
 
+        assert mock_get.call_args.args[0] == "https://cloakbrowser.dev/api/download/version"
+
+    def test_explicit_preview_selects_preview(self, tmp_path):
+        """The explicit argument is now the only way to reach the preview channel."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"version": "151.0.1234.5"}
+        mock_resp.raise_for_status = MagicMock()
+
+        with (
+            patch("cloakbrowser.license.get_cache_dir", return_value=tmp_path),
+            patch(
+                "cloakbrowser.license.httpx.get", return_value=mock_resp
+            ) as mock_get,
+        ):
+            get_pro_latest_version("preview")
+
         assert mock_get.call_args.args[0].endswith("?channel=preview")
 
-    def test_explicit_stable_overrides_preview_environment(self, tmp_path):
+    def test_explicit_stable_selects_stable(self, tmp_path):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"version": "150.0.1234.5"}
         mock_resp.raise_for_status = MagicMock()
 
         with (
-            patch.dict(os.environ, {"CLOAKBROWSER_RELEASE_CHANNEL": "preview"}),
             patch("cloakbrowser.license.get_cache_dir", return_value=tmp_path),
             patch(
                 "cloakbrowser.license.httpx.get", return_value=mock_resp
@@ -681,42 +702,42 @@ class TestGetSessionSeats:
 
 
 class TestConfigPro:
-    def test_binary_dir_pro_suffix(self, tmp_path):
+    """Cache layout for Pro builds. The cache root has no env override in this
+    fork, so these read it via get_cache_dir() (conftest isolates it per test)."""
+
+    def test_binary_dir_pro_suffix(self):
         from cloakbrowser.config import get_binary_dir
 
-        with patch.dict(os.environ, {"CLOAKBROWSER_CACHE_DIR": str(tmp_path)}):
-            normal = get_binary_dir("147.0.0.0")
-            pro = get_binary_dir("147.0.0.0", pro=True)
+        normal = get_binary_dir("147.0.0.0")
+        pro = get_binary_dir("147.0.0.0", pro=True)
 
         assert str(normal).endswith("chromium-147.0.0.0")
         assert str(pro).endswith("chromium-147.0.0.0-pro")
 
-    def test_binary_dir_default_no_suffix(self, tmp_path):
+    def test_binary_dir_default_no_suffix(self):
         from cloakbrowser.config import get_binary_dir
 
-        with patch.dict(os.environ, {"CLOAKBROWSER_CACHE_DIR": str(tmp_path)}):
-            normal = get_binary_dir("147.0.0.0")
+        assert not str(get_binary_dir("147.0.0.0")).endswith("-pro")
 
-        assert not str(normal).endswith("-pro")
+    def test_effective_version_pro_marker(self):
+        from cloakbrowser.config import (
+            get_binary_path,
+            get_cache_dir,
+            get_effective_version,
+            get_platform_tag,
+        )
 
-    def test_effective_version_pro_marker(self, tmp_path):
-        from cloakbrowser.config import get_effective_version, get_platform_tag
+        cache = get_cache_dir()
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / f"latest_pro_version_{get_platform_tag()}").write_text("147.0.5555.1")
 
-        with patch.dict(os.environ, {"CLOAKBROWSER_CACHE_DIR": str(tmp_path)}):
-            tag = get_platform_tag()
-            marker = tmp_path / f"latest_pro_version_{tag}"
-            marker.write_text("147.0.5555.1")
+        # Create the binary so effective version returns it
+        bp = get_binary_path("147.0.5555.1", pro=True)
+        bp.parent.mkdir(parents=True, exist_ok=True)
+        bp.write_text("fake")
+        bp.chmod(0o755)  # get_effective_version(pro) requires an executable binary
 
-            # Create the binary so effective version returns it
-            from cloakbrowser.config import get_binary_path
-            bp = get_binary_path("147.0.5555.1", pro=True)
-            bp.parent.mkdir(parents=True, exist_ok=True)
-            bp.write_text("fake")
-            bp.chmod(0o755)  # get_effective_version(pro) requires an executable binary
-
-            version = get_effective_version(pro=True)
-
-        assert version == "147.0.5555.1"
+        assert get_effective_version(pro=True) == "147.0.5555.1"
 
 
 # ── binary_info tier reporting ────────────────────────
@@ -726,53 +747,54 @@ class TestBinaryInfoTier:
     """binary_info() reports tier from the binary actually on disk — NOT from a
     cached license, which can disagree with what's installed or the active key."""
 
-    def test_free_when_no_pro_binary_even_if_license_cached(self, tmp_path):
+    def test_free_when_no_pro_binary_even_if_license_cached(self):
+        from cloakbrowser.config import get_cache_dir
         from cloakbrowser.download import binary_info
 
-        with patch.dict(os.environ, {"CLOAKBROWSER_CACHE_DIR": str(tmp_path)}, clear=False):
-            # A valid, fresh license is cached...
-            (tmp_path / ".license_cache").write_text(json.dumps({
-                "key_sha256": hashlib.sha256(b"cb_x").hexdigest(),
-                "valid": True, "plan": "solo", "expires": None,
-                "validated_at": time.time(),
-            }))
-            # ...but no Pro binary is on disk → must report free, not pro.
-            info = binary_info()
+        cache = get_cache_dir()
+        cache.mkdir(parents=True, exist_ok=True)
+        # A valid, fresh license is cached...
+        (cache / ".license_cache").write_text(json.dumps({
+            "key_sha256": hashlib.sha256(b"cb_x").hexdigest(),
+            "valid": True, "plan": "solo", "expires": None,
+            "validated_at": time.time(),
+        }))
+        # ...but no Pro binary is on disk → must report free, not pro.
+        assert binary_info()["tier"] == "free"
 
-        assert info["tier"] == "free"
-
-    def test_pro_when_pro_binary_installed(self, tmp_path):
-        from cloakbrowser.config import get_binary_path, get_platform_tag
+    def test_pro_when_pro_binary_installed(self):
+        from cloakbrowser.config import get_binary_path, get_cache_dir, get_platform_tag
         from cloakbrowser.download import binary_info
 
-        with patch.dict(os.environ, {"CLOAKBROWSER_CACHE_DIR": str(tmp_path)}, clear=False):
-            tag = get_platform_tag()
-            (tmp_path / f"latest_pro_version_{tag}").write_text("147.0.5555.1")
-            bp = get_binary_path("147.0.5555.1", pro=True)
-            bp.parent.mkdir(parents=True, exist_ok=True)
-            bp.write_text("fake")
-            bp.chmod(0o755)
-            info = binary_info()
+        cache = get_cache_dir()
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / f"latest_pro_version_{get_platform_tag()}").write_text("147.0.5555.1")
+        bp = get_binary_path("147.0.5555.1", pro=True)
+        bp.parent.mkdir(parents=True, exist_ok=True)
+        bp.write_text("fake")
+        bp.chmod(0o755)
+        info = binary_info()
 
         assert info["tier"] == "pro"
         assert info["version"] == "147.0.5555.1"
 
-    def test_preview_pro_download_url_carries_channel(self, tmp_path):
-        from cloakbrowser.config import get_binary_path, get_platform_tag
+    def test_preview_pro_download_url_carries_channel(self):
+        from cloakbrowser.config import get_binary_path, get_cache_dir, get_platform_tag
         from cloakbrowser.download import binary_info
 
-        with patch.dict(os.environ, {"CLOAKBROWSER_CACHE_DIR": str(tmp_path)}, clear=False):
-            tag = get_platform_tag()
-            # Same cached Pro binary satisfies both channels (version-keyed cache dir);
-            # only the reported download URL should differ by channel.
-            (tmp_path / f"latest_pro_version_preview_{tag}").write_text("151.0.7900.10.1")
-            (tmp_path / f"latest_pro_version_{tag}").write_text("151.0.7900.10.1")
-            bp = get_binary_path("151.0.7900.10.1", pro=True)
-            bp.parent.mkdir(parents=True, exist_ok=True)
-            bp.write_text("fake")
-            bp.chmod(0o755)
-            preview_info = binary_info(release_channel="preview")
-            stable_info = binary_info(release_channel="stable")
+        cache = get_cache_dir()
+        cache.mkdir(parents=True, exist_ok=True)
+        tag = get_platform_tag()
+        # Same cached Pro binary satisfies both channels (version-keyed cache dir);
+        # only the reported download URL should differ by channel.
+        (cache / f"latest_pro_version_preview_{tag}").write_text("151.0.7900.10.1")
+        (cache / f"latest_pro_version_{tag}").write_text("151.0.7900.10.1")
+        bp = get_binary_path("151.0.7900.10.1", pro=True)
+        bp.parent.mkdir(parents=True, exist_ok=True)
+        bp.write_text("fake")
+        bp.chmod(0o755)
+        preview_info = binary_info(release_channel="preview")
+        stable_info = binary_info(release_channel="stable")
 
         assert preview_info["download_url"].endswith("/api/download/latest?channel=preview")
         assert stable_info["download_url"].endswith("/api/download/latest")
@@ -791,9 +813,7 @@ class TestEnsureBinaryProRouting:
 
     def test_verification_failure_propagates_verbatim(self):
         """A BinaryVerificationError must surface verbatim — never reach free."""
-        with patch.dict(os.environ, {"CLOAKBROWSER_DOWNLOAD_URL": ""}, clear=False), \
-             patch("cloakbrowser.download.get_local_binary_override", return_value=None), \
-             patch("cloakbrowser.license.resolve_license_key", return_value="cb_x"), \
+        with patch("cloakbrowser.license.resolve_license_key", return_value="cb_x"), \
              patch("cloakbrowser.license.validate_license",
                    return_value=LicenseInfo(valid=True, plan="solo", expires=None)), \
              patch("cloakbrowser.download._ensure_pro_binary",
@@ -806,9 +826,7 @@ class TestEnsureBinaryProRouting:
     def test_transient_failure_hard_errors_not_free(self):
         """A transient Pro failure must surface a clear, actionable error carrying
         the underlying cause — NOT silently download the free binary."""
-        with patch.dict(os.environ, {"CLOAKBROWSER_DOWNLOAD_URL": ""}, clear=False), \
-             patch("cloakbrowser.download.get_local_binary_override", return_value=None), \
-             patch("cloakbrowser.license.resolve_license_key", return_value="cb_x"), \
+        with patch("cloakbrowser.license.resolve_license_key", return_value="cb_x"), \
              patch("cloakbrowser.license.validate_license",
                    return_value=LicenseInfo(valid=True, plan="solo", expires=None)), \
              patch("cloakbrowser.download._ensure_pro_binary",
@@ -828,9 +846,7 @@ class TestEnsureBinaryProRouting:
         not_found = httpx.HTTPStatusError(
             "404 Not Found", request=req, response=httpx.Response(404, request=req)
         )
-        with patch.dict(os.environ, {"CLOAKBROWSER_DOWNLOAD_URL": ""}, clear=False), \
-             patch("cloakbrowser.download.get_local_binary_override", return_value=None), \
-             patch("cloakbrowser.download.get_platform_tag", return_value="darwin-x64"), \
+        with patch("cloakbrowser.download.get_platform_tag", return_value="darwin-x64"), \
              patch("cloakbrowser.license.resolve_license_key", return_value="cb_x"), \
              patch("cloakbrowser.license.validate_license",
                    return_value=LicenseInfo(valid=True, plan="solo", expires=None)), \
@@ -843,9 +859,7 @@ class TestEnsureBinaryProRouting:
     def test_invalid_key_aborts_not_free(self):
         """A supplied key the server rejects (valid=False) must abort with a clear
         license error — NOT silently downgrade to the free binary."""
-        with patch.dict(os.environ, {"CLOAKBROWSER_DOWNLOAD_URL": ""}, clear=False), \
-             patch("cloakbrowser.download.get_local_binary_override", return_value=None), \
-             patch("cloakbrowser.license.resolve_license_key", return_value="cb_bad"), \
+        with patch("cloakbrowser.license.resolve_license_key", return_value="cb_bad"), \
              patch("cloakbrowser.license.validate_license",
                    return_value=LicenseInfo(valid=False, plan="solo", expires=None)), \
              patch("cloakbrowser.download._ensure_pro_binary",
@@ -858,9 +872,7 @@ class TestEnsureBinaryProRouting:
     def test_unvalidatable_key_aborts_not_free(self):
         """A supplied key that can't be validated (server unreachable, no cache →
         validate_license returns None) must abort — NOT silently downgrade."""
-        with patch.dict(os.environ, {"CLOAKBROWSER_DOWNLOAD_URL": ""}, clear=False), \
-             patch("cloakbrowser.download.get_local_binary_override", return_value=None), \
-             patch("cloakbrowser.license.resolve_license_key", return_value="cb_x"), \
+        with patch("cloakbrowser.license.resolve_license_key", return_value="cb_x"), \
              patch("cloakbrowser.license.validate_license", return_value=None), \
              patch("cloakbrowser.download._ensure_pro_binary",
                    side_effect=AssertionError("MUST NOT reach the Pro path")), \
@@ -927,9 +939,12 @@ class TestBuildLaunchEnv:
             result2 = build_launch_env(user_env={"KEEP": "me"})
             assert result2 == {"KEEP": "me", "CLOAKBROWSER_LICENSE_KEY": "cb_file_key"}
 
-    def test_custom_cache_dir_injects_env(self, tmp_path):
-        """Key from CLOAKBROWSER_CACHE_DIR/license.key → env injection needed
-        because the binary looks at ~/.cloakbrowser/license.key, not the custom path."""
+    def test_cache_dir_outside_home_injects_env(self, tmp_path):
+        """Key from a cache dir that is not ~/.cloakbrowser → env injection needed,
+        because the binary only looks at ~/.cloakbrowser/license.key.
+
+        No env var can move the cache root in this fork, so this now guards the
+        divergence defensively rather than a user-reachable configuration."""
         home_dir = tmp_path / "home"
         home_dir.mkdir()
         custom_cache = tmp_path / "custom-cache"

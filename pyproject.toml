@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cloakbrowser"
 dynamic = ["version"]
-description = "Stealth Chromium that passes every bot detection test. Drop-in Playwright replacement with source-level fingerprint patches."
+description = "Hardened fork of the CloakBrowser wrapper: a Playwright drop-in with one stable, truthful browser identity per profile."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
@@ -13,26 +13,12 @@ authors = [
     { name = "CloakHQ", email = "cloakhq@pm.me" },
 ]
 keywords = [
-    "stealth",
     "browser",
     "chromium",
     "playwright",
-    "puppeteer",
-    "scraping",
-    "web-scraping",
-    "anti-detect",
-    "antidetect",
-    "undetected",
-    "bot-detection",
     "fingerprint",
-    "recaptcha",
-    "cloudflare",
-    "turnstile",
-    "datadome",
-    "captcha",
     "headless",
     "automation",
-    "ai-agent",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",

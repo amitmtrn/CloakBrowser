@@ -905,9 +905,11 @@ def main() -> None:
         port,
     )
 
-    in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
-    host = "0.0.0.0" if in_container else "127.0.0.1"
-    web.run_app(app, host=host, port=port, print=None)
+    # Always loopback. Upstream widens this to 0.0.0.0 inside a container so the
+    # port is reachable from the host, but the CDP endpoint has no authentication
+    # — the Origin check only stops browser-driven requests, not any process that
+    # can reach the port. Publish it deliberately with an SSH tunnel if needed.
+    web.run_app(app, host="127.0.0.1", port=port, print=None)
 
 
 if __name__ == "__main__":

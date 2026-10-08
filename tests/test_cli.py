@@ -150,10 +150,7 @@ def test_quick_skips_pro_latest_lookup(capsys):
 def test_info_reports_preview_stable_fallback(capsys):
     valid = LicenseInfo(valid=True, plan="business", expires=None)
     release = ProReleaseInfo("150.0.7871.114.3", "preview", "stable", True)
-    with (
-        patch.dict(os.environ, {"CLOAKBROWSER_RELEASE_CHANNEL": "preview"}),
-        patch("cloakbrowser.license.get_pro_latest_release", return_value=release),
-    ):
+    with patch("cloakbrowser.license.get_pro_latest_release", return_value=release):
         _run(Namespace(quick=False, json=False), key="cb_test", license_info=valid)
     assert "Channel:   Preview → Stable fallback" in capsys.readouterr().out
 

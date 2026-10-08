@@ -32,22 +32,32 @@ RUN cd js && npm install && npm run build
 # Examples
 COPY examples/ examples/
 
-# Pre-download stealth Chromium binary during build (not at runtime)
-# Remove welcome marker so users see it on first container run
-RUN python -c "from cloakbrowser import ensure_binary; ensure_binary()" \
-    && rm -f ~/.cloakbrowser/.welcome_shown
-
 # CLI shortcuts
 COPY bin/cloaktest /usr/local/bin/cloaktest
 COPY bin/cloakserve /usr/local/bin/cloakserve
 COPY bin/fetch-widevine.py /usr/local/bin/fetch-widevine.py
 RUN chmod +x /usr/local/bin/cloaktest /usr/local/bin/cloakserve /usr/local/bin/fetch-widevine.py
 
-EXPOSE 9222
-
 # Xvfb entrypoint for headed mode support
 COPY bin/docker-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# Run unprivileged so the Chromium namespace/seccomp sandbox stays on. Upstream
+# runs as uid 0, where Chromium refuses to start without --no-sandbox; this fork
+# no longer passes that flag, so a non-root uid is load-bearing, not hygiene.
+# /tmp is shared with the entrypoint's Xvfb lock cleanup, so keep it writable.
+RUN useradd --create-home --shell /bin/bash cloak \
+    && chown -R cloak:cloak /app
+USER cloak
+
+# Pre-download the Chromium binary during build (not at runtime), as the
+# unprivileged user so it lands in that user's ~/.cloakbrowser cache.
+# Remove welcome marker so users see it on first container run
+RUN python -c "from cloakbrowser import ensure_binary; ensure_binary()" \
+    && rm -f ~/.cloakbrowser/.welcome_shown
+
+# No EXPOSE for the CDP port: cloakserve is unauthenticated and now binds
+# loopback only. Forward it deliberately (ssh -L) rather than by default.
 
 ENV DISPLAY=:99
 

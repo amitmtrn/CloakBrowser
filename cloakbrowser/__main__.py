@@ -128,10 +128,6 @@ def _resolve_license() -> tuple[dict, bool]:
     from .license import resolve_license_key, validate_license
 
     key = resolve_license_key(None)
-    # ensure_binary disables Pro routing when a custom download URL is set, so the
-    # diagnostic must report free too (matches download.py).
-    if os.environ.get("CLOAKBROWSER_DOWNLOAD_URL"):
-        key = None
     if not key:
         return {"tier": "free"}, False
     try:
@@ -148,8 +144,8 @@ def _resolve_license() -> tuple[dict, bool]:
 def _effective_binary(entitled_pro: bool, quick: bool = False) -> dict:
     """Describe the binary ensure_binary would actually launch (no download).
 
-    Mirrors ensure_binary's resolution (override > version pin > license tier).
-    Unlike binary_info(), a Pro binary on disk is only reported when the license
+    Mirrors ensure_binary's resolution (version pin > license tier). Unlike
+    binary_info(), a Pro binary on disk is only reported when the license
     entitles Pro — so a keyless run correctly shows the free binary even if a
     Pro binary is cached.
     """
@@ -159,24 +155,9 @@ def _effective_binary(entitled_pro: bool, quick: bool = False) -> dict:
         get_binary_dir,
         get_binary_path,
         get_effective_version,
-        get_local_binary_override,
         normalize_release_channel,
         normalize_requested_version,
     )
-
-    override = get_local_binary_override()
-    if override:
-        return {
-            "version": None,
-            "latest_version": None,
-            "pinned": False,
-            "tier": "override",
-            "bundled_version": CHROMIUM_VERSION,
-            "path": override,
-            "installed": os.path.isfile(override),
-            "cache_dir": None,
-            "override": override,
-        }
 
     requested = normalize_requested_version(None)
     requested_channel = normalize_release_channel(None)
@@ -202,15 +183,11 @@ def _effective_binary(entitled_pro: bool, quick: bool = False) -> dict:
         version = requested
     elif entitled_pro:
         # Mirror ensure_binary: Preview/Stable resolution picks what the next
-        # launch will run, while AUTO_UPDATE=false keeps an installed channel build.
+        # launch will run.
         installed_version = get_effective_version(
             pro=True, release_channel=requested_channel
         )
-        auto_update = os.environ.get("CLOAKBROWSER_AUTO_UPDATE", "true").lower()
-        updates_enabled = auto_update != "false"
-        if installed_version and not updates_enabled:
-            version = installed_version
-        elif latest_version and (
+        if latest_version and (
             not installed_version or _version_newer(latest_version, installed_version)
         ):
             version = latest_version
@@ -234,7 +211,6 @@ def _effective_binary(entitled_pro: bool, quick: bool = False) -> dict:
         "path": str(path) if path else None,
         "installed": bool(path) and path.exists(),
         "cache_dir": str(get_binary_dir(version, pro=entitled_pro)) if version else None,
-        "override": None,
     }
 
 
@@ -408,50 +384,42 @@ def _print_diagnostics(diag: dict) -> None:
     if "error" in binary:
         print(f"Binary:    unavailable ({binary['error']})")
     else:
-        if binary["tier"] == "override":
-            print("Version:   set via CLOAKBROWSER_BINARY_PATH (see Launch line)")
+        requested_channel = binary.get("requested_channel", "stable")
+        resolved_channel = binary.get("resolved_channel")
+        if binary.get("channel_fallback"):
+            print(f"Channel:   Preview {ARROW} Stable fallback")
+        elif resolved_channel:
+            print(f"Channel:   {resolved_channel.capitalize()}")
         else:
-            requested_channel = binary.get("requested_channel", "stable")
-            resolved_channel = binary.get("resolved_channel")
-            if binary.get("channel_fallback"):
-                print(f"Channel:   Preview {ARROW} Stable fallback")
-            elif resolved_channel:
-                print(f"Channel:   {resolved_channel.capitalize()}")
+            print(f"Channel:   {requested_channel.capitalize()}")
+        latest = binary.get("latest_version")
+        if latest:
+            # Pro: show what launches now AND the server's latest, so the two
+            # can never silently diverge.
+            print(f"Version:   {binary['version']} ({binary['tier']}) {DASH} next launch")
+            if latest == binary["version"] and binary.get("installed"):
+                print(f"Latest:    {latest} (up to date)")
+            elif latest == binary["version"]:
+                print(f"Latest:    {latest} (downloads on next launch)")
+            elif binary.get("pinned"):
+                print(f"Latest:    {latest} (available {DASH} pinned in config.py)")
             else:
-                print(f"Channel:   {requested_channel.capitalize()}")
-            latest = binary.get("latest_version")
-            if latest:
-                # Pro: show what launches now AND the server's latest, so the two
-                # can never silently diverge.
-                print(f"Version:   {binary['version']} ({binary['tier']}) {DASH} next launch")
-                if latest == binary["version"] and binary.get("installed"):
-                    print(f"Latest:    {latest} (up to date)")
-                elif latest == binary["version"]:
-                    print(f"Latest:    {latest} (downloads on next launch)")
-                elif binary.get("pinned"):
-                    print(
-                        f"Latest:    {latest} (available {DASH} pinned; unset "
-                        "CLOAKBROWSER_VERSION to upgrade)"
-                    )
-                else:
-                    print(f"Latest:    {latest} (server-resolved; installed build retained)")
-                installed_version = binary.get("installed_version")
-                if installed_version and installed_version != binary["version"]:
-                    print(f"Installed: {installed_version}")
-            elif binary["version"] is None:
-                # Pro with no cached build and no server answer (e.g. offline).
-                print(
-                    f"Version:   not downloaded yet ({binary['tier']}) "
-                    f"{DASH} next launch downloads the latest"
-                )
-            else:
-                print(f"Version:   {binary['version']} ({binary['tier']})")
+                print(f"Latest:    {latest} (server-resolved; installed build retained)")
+            installed_version = binary.get("installed_version")
+            if installed_version and installed_version != binary["version"]:
+                print(f"Installed: {installed_version}")
+        elif binary["version"] is None:
+            # Pro with no cached build and no server answer (e.g. offline).
+            print(
+                f"Version:   not downloaded yet ({binary['tier']}) "
+                f"{DASH} next launch downloads the latest"
+            )
+        else:
+            print(f"Version:   {binary['version']} ({binary['tier']})")
         print(f"Binary:    {binary['path']}")
         print(f"Installed: {binary['installed']}")
         if binary.get("cache_dir"):
             print(f"Cache:     {binary['cache_dir']}")
-        if binary.get("override"):
-            print(f"Override:  {binary['override']} (CLOAKBROWSER_BINARY_PATH)")
 
     launch = diag["launch"]
     if not launch.get("tested"):

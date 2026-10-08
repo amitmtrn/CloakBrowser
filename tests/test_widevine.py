@@ -5,19 +5,23 @@ import json
 import pytest
 
 from cloakbrowser import widevine
+from cloakbrowser.config import get_cache_dir
 from cloakbrowser.widevine import resolve_widevine_cdm_dir, seed_widevine_hint
 
 _HINT = "WidevineCdm/latest-component-updated-widevine-cdm"
 
 
 @pytest.fixture(autouse=True)
-def _force_linux(monkeypatch, tmp_path):
-    """Run as if on Linux unless a test overrides it (seeding is Linux-only)."""
+def _force_linux(monkeypatch):
+    """Run as if on Linux unless a test overrides it (seeding is Linux-only).
+
+    The cache-root fallback is already isolated from the host's real
+    ``~/.cloakbrowser`` by conftest's HOME redirect — the cache root has no env
+    override in this fork.
+    """
     monkeypatch.setattr(widevine.platform, "system", lambda: "Linux")
     monkeypatch.delenv("CLOAKBROWSER_WIDEVINE", raising=False)
     monkeypatch.delenv("CLOAKBROWSER_WIDEVINE_CDM", raising=False)
-    # Isolate the cache-root fallback from any real ~/.cloakbrowser on the host.
-    monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(tmp_path / "_isolated_cache"))
 
 
 def _make_cdm(dirpath):
@@ -115,35 +119,29 @@ def test_env_var_is_exclusive(tmp_path, monkeypatch):
     assert resolve_widevine_cdm_dir(binary) is None
 
 
-def test_resolve_falls_back_to_cache_root(tmp_path, monkeypatch):
+def test_resolve_falls_back_to_cache_root(tmp_path):
     """No CDM next to the binary -> auto-detect falls back to <cache>/WidevineCdm.
 
     Simulates the Pro case: a Pro binary sits in its own chromium-<ver>-pro dir
     with no adjacent CDM, while the Docker auto-fetch left one at the cache root.
     """
-    cache = tmp_path / "cache"
-    monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(cache))
-    cdm = _make_cdm(cache / "WidevineCdm")
+    cdm = _make_cdm(get_cache_dir() / "WidevineCdm")
     pro_binary = tmp_path / "chromium-148.0-pro" / "chrome"
     pro_binary.parent.mkdir(parents=True)  # binary dir exists, but has no CDM
     assert resolve_widevine_cdm_dir(pro_binary) == cdm.resolve()
 
 
-def test_resolve_binary_dir_wins_over_cache_root(tmp_path, monkeypatch):
+def test_resolve_binary_dir_wins_over_cache_root(tmp_path):
     """A manual sideload next to the binary takes precedence over the cache root."""
-    cache = tmp_path / "cache"
-    monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(cache))
-    _make_cdm(cache / "WidevineCdm")  # cache-root CDM present...
+    _make_cdm(get_cache_dir() / "WidevineCdm")  # cache-root CDM present...
     binary = _binary(tmp_path)
     next_to = _make_cdm(binary.parent / "WidevineCdm")  # ...but sideload wins
     assert resolve_widevine_cdm_dir(binary) == next_to.resolve()
 
 
-def test_seeds_hint_from_cache_root_fallback(tmp_path, monkeypatch):
+def test_seeds_hint_from_cache_root_fallback(tmp_path):
     """End-to-end: a cache-root CDM seeds the hint for a binary with none adjacent."""
-    cache = tmp_path / "cache"
-    monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(cache))
-    cdm = _make_cdm(cache / "WidevineCdm")
+    cdm = _make_cdm(get_cache_dir() / "WidevineCdm")
     profile = tmp_path / "profile"
     seed_widevine_hint(profile, _binary(tmp_path))  # binary has no adjacent CDM
     assert json.loads((profile / _HINT).read_text())["Path"] == str(cdm.resolve())

@@ -5,13 +5,18 @@ from unittest import mock
 import pytest
 
 import cloakbrowser.__main__ as m
+from cloakbrowser.config import get_cache_dir
 from cloakbrowser.license import LicenseInfo
 
 
 @pytest.fixture
-def cache_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("CLOAKBROWSER_CACHE_DIR", str(tmp_path))
-    return tmp_path
+def cache_dir():
+    """The cache root the commands actually write to.
+
+    No env override exists for it in this fork; conftest's HOME redirect already
+    points ``~/.cloakbrowser`` at a per-test temp dir.
+    """
+    return get_cache_dir()
 
 
 def _validate(**kw):
